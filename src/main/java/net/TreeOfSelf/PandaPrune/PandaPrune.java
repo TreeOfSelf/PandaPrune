@@ -1,11 +1,16 @@
 package net.TreeOfSelf.PandaPrune;
 
+import com.mojang.serialization.Codec;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.attachment.v1.AttachmentRegistry;
+import net.fabricmc.fabric.api.attachment.v1.AttachmentTarget;
+import net.fabricmc.fabric.api.attachment.v1.AttachmentType;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.InteractionResult;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -17,10 +22,14 @@ public class PandaPrune implements ModInitializer {
 	public static final Logger LOGGER = LoggerFactory.getLogger("PandaPrune");
 	public static PandaPruneConfig CONFIG = new PandaPruneConfig();
 
-	// InhabitedTime alone does not mark the chunk unsaved, so it would never reach disk
+	// own flag, not InhabitedTime (that also drives local difficulty); unknown attachments are dropped if the mod is removed
+	public static final String USED_ID = "panda-prune:used";
+	public static final AttachmentType<Boolean> USED = AttachmentRegistry.createPersistent(Identifier.parse(USED_ID), Codec.BOOL);
+
 	public static void protect(ChunkAccess chunk) {
-		if (chunk.getInhabitedTime() < CONFIG.pruneMinInhabitedTicks) {
-			chunk.setInhabitedTime(CONFIG.pruneMinInhabitedTicks);
+		AttachmentTarget target = (AttachmentTarget) chunk;
+		if (!target.hasAttached(USED)) {
+			target.setAttached(USED, true);
 			chunk.markUnsaved();
 		}
 	}
@@ -31,6 +40,7 @@ public class PandaPrune implements ModInitializer {
 		FeatureSpills.init();
 
 		ServerLifecycleEvents.SERVER_STARTING.register(server -> {
+			Pruner.recordOldChunks(server.getWorldPath(LevelResource.ROOT));
 			if (CONFIG.pruneOnStartup) Pruner.pruneWorld(server.getWorldPath(LevelResource.ROOT), CONFIG);
 		});
 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> {

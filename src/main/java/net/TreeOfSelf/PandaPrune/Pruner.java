@@ -31,44 +31,117 @@ public final class Pruner {
 	private static final int SECTOR = 4096;
 	private static final int EXTERNAL_FLAG = 128;
 	private static final String ATTACHMENTS = "fabric:attachments";
+	private static final String OLD_CHUNKS = "prune_old_chunks";
 
 	private Pruner() {
 	}
 
-	public static void pruneWorld(Path worldRoot, PandaPruneConfig config) {
+	private static List<Path> dimensions(Path worldRoot) {
 		Path dimensions = worldRoot.resolve("dimensions");
-		if (!Files.isDirectory(dimensions)) return;
-		List<Path> dims;
+		if (!Files.isDirectory(dimensions)) return List.of();
 		try (Stream<Path> walk = Files.walk(dimensions)) {
-			dims = walk.filter(p -> p.getFileName().toString().equals("region") && Files.isDirectory(p))
+			return walk.filter(p -> p.getFileName().toString().equals("region") && Files.isDirectory(p))
 					.map(Path::getParent).sorted().toList();
 		} catch (IOException e) {
 			PandaPrune.LOGGER.error("Prune: could not list dimensions", e);
+			return List.of();
+		}
+	}
+
+	private static String dimensionId(Path worldRoot, Path dim) {
+		Path rel = worldRoot.resolve("dimensions").relativize(dim);
+		if (rel.getNameCount() < 2) return null;
+		return rel.getName(0) + ":" + rel.subpath(1, rel.getNameCount()).toString().replace('\\', '/');
+	}
+
+	private static Path oldChunksFile(Path dir, String id) {
+		return dir.resolve(id.replace(':', '/') + ".bin");
+	}
+
+	// chunks that existed before Prune was installed: their pre-install use was never tracked
+	public static void recordOldChunks(Path worldRoot) {
+		Path marker = worldRoot.resolve(OLD_CHUNKS);
+		if (Files.isDirectory(marker)) return;
+		Path tmp = worldRoot.resolve(OLD_CHUNKS + ".tmp");
+		try {
+			deleteTree(tmp);
+			Files.createDirectories(tmp);
+			for (Path dim : dimensions(worldRoot)) {
+				String id = dimensionId(worldRoot, dim);
+				if (id == null) continue;
+				LongSet chunks = new LongOpenHashSet();
+				for (Path file : regionFiles(dim.resolve("region"))) {
+					try {
+						Region region = Region.readHeader(file);
+						for (int i = 0; i < 1024; i++) if (region.listed(i)) chunks.add(region.pos(i));
+					} catch (IOException e) {
+						throw new IOException("could not read " + file, e);
+					}
+				}
+				Path out = oldChunksFile(tmp, id);
+				Files.createDirectories(out.getParent());
+				try (DataOutputStream data = new DataOutputStream(new java.io.BufferedOutputStream(
+						new java.util.zip.GZIPOutputStream(Files.newOutputStream(out))))) {
+					data.writeInt(chunks.size());
+					for (long pos : chunks) data.writeLong(pos);
+				}
+				PandaPrune.LOGGER.info("Prune: {} has {} chunks from before Prune was installed, they are never pruned unless pruneOldChunks is on", id, chunks.size());
+			}
+			Files.move(tmp, marker, StandardCopyOption.ATOMIC_MOVE);
+		} catch (IOException e) {
+			PandaPrune.LOGGER.error("Prune: could not record the chunks from before Prune was installed", e);
+		}
+	}
+
+	private static void deleteTree(Path dir) throws IOException {
+		if (!Files.exists(dir)) return;
+		try (Stream<Path> walk = Files.walk(dir)) {
+			for (Path p : walk.sorted(java.util.Comparator.reverseOrder()).toList()) Files.delete(p);
+		}
+	}
+
+	private static LongSet loadOldChunks(Path worldRoot, String id) throws IOException {
+		LongSet chunks = new LongOpenHashSet();
+		Path file = oldChunksFile(worldRoot.resolve(OLD_CHUNKS), id);
+		if (!Files.exists(file)) return chunks;
+		try (DataInputStream data = new DataInputStream(new java.io.BufferedInputStream(
+				new java.util.zip.GZIPInputStream(Files.newInputStream(file))))) {
+			int n = data.readInt();
+			for (int i = 0; i < n; i++) chunks.add(data.readLong());
+		}
+		return chunks;
+	}
+
+	public static void pruneWorld(Path worldRoot, PandaPruneConfig config) {
+		if (!Files.isDirectory(worldRoot.resolve(OLD_CHUNKS))) {
+			PandaPrune.LOGGER.error("Prune: no record of the chunks from before Prune was installed, not pruning");
 			return;
 		}
-		for (Path dim : dims) {
-			Path rel = dimensions.relativize(dim);
-			if (rel.getNameCount() < 2) continue;
-			String id = rel.getName(0) + ":" + rel.subpath(1, rel.getNameCount()).toString().replace('\\', '/');
+		for (Path dim : dimensions(worldRoot)) {
+			String id = dimensionId(worldRoot, dim);
+			if (id == null) continue;
 			if (!config.pruneDimensions.isEmpty() && !config.pruneDimensions.contains(id)) continue;
 			try {
-				pruneDimension(id, dim, config.pruneMinInhabitedTicks);
+				LongSet old = config.pruneOldChunks ? new LongOpenHashSet() : loadOldChunks(worldRoot, id);
+				boolean pruned = pruneDimension(id, dim, config.pruneMinInhabitedTicks, old);
+				// every old chunk was judged like any other, so the list is done; regenerated ones are new chunks
+				if (config.pruneOldChunks && pruned) Files.deleteIfExists(oldChunksFile(worldRoot.resolve(OLD_CHUNKS), id));
 			} catch (Exception e) {
 				PandaPrune.LOGGER.error("Prune: {} failed, left as it was", id, e);
 			}
 		}
 	}
 
-	private record Scan(LongSet keep, LongSet withSpills, long total, long used) {
+	private record Scan(LongSet keep, LongSet withSpills, long total, long used, long old) {
 	}
 
-	private static void pruneDimension(String id, Path dim, long minTicks) throws IOException {
+	private static boolean pruneDimension(String id, Path dim, long minTicks, LongSet old) throws IOException {
 		long start = System.currentTimeMillis();
 		Path regionDir = dim.resolve("region");
-		Scan scan = scan(regionDir, minTicks);
-		if (scan.total() > 0 && scan.used() == 0) {
+		Scan scan = scan(regionDir, minTicks, old);
+		if (scan.total() > scan.old() && scan.used() == 0) {
 			PandaPrune.LOGGER.warn("Prune: {} has {} chunks but none used, not pruning it", id, scan.total());
-			return;
+			return false;
 		}
 		AtomicLong before = new AtomicLong(), after = new AtomicLong(), records = new AtomicLong();
 		for (String sub : new String[]{"region", "entities", "poi"}) {
@@ -84,9 +157,10 @@ public final class Pruner {
 				}
 			});
 		}
-		PandaPrune.LOGGER.info("Prune: {} kept {} of {} chunks ({} used), {} -> {} MB, {} feature records dropped, {} s",
-				id, scan.keep().size(), scan.total(), scan.used(), before.get() >> 20, after.get() >> 20,
+		PandaPrune.LOGGER.info("Prune: {} kept {} of {} chunks ({} used, {} from before install), {} -> {} MB, {} feature records dropped, {} s",
+				id, scan.keep().size(), scan.total(), scan.used(), scan.old(), before.get() >> 20, after.get() >> 20,
 				records.get(), (System.currentTimeMillis() - start) / 1000.0);
+		return true;
 	}
 
 	private static List<Path> regionFiles(Path dir) throws IOException {
@@ -95,9 +169,9 @@ public final class Pruner {
 		}
 	}
 
-	private static Scan scan(Path regionDir, long minTicks) throws IOException {
+	private static Scan scan(Path regionDir, long minTicks, LongSet old) throws IOException {
 		LongSet keep = new LongOpenHashSet(), withSpills = new LongOpenHashSet();
-		AtomicLong total = new AtomicLong(), used = new AtomicLong();
+		AtomicLong total = new AtomicLong(), used = new AtomicLong(), oldKept = new AtomicLong();
 		regionFiles(regionDir).parallelStream().forEach(file -> {
 			LongSet k = new LongOpenHashSet(), s = new LongOpenHashSet();
 			try {
@@ -106,12 +180,17 @@ public final class Pruner {
 					if (!region.exists(i)) continue;
 					total.incrementAndGet();
 					long pos = region.pos(i);
+					if (old.contains(pos)) {
+						k.add(pos);
+						oldKept.incrementAndGet();
+						continue;
+					}
 					CompoundTag tag = region.readTag(i);
 					if (tag == null) {
 						k.add(pos);
 						continue;
 					}
-					if (tag.getLongOr("InhabitedTime", 0L) >= minTicks) {
+					if (tag.getLongOr("InhabitedTime", 0L) >= minTicks || tag.getCompoundOrEmpty(ATTACHMENTS).contains(PandaPrune.USED_ID)) {
 						k.add(pos);
 						used.incrementAndGet();
 						if (tag.getCompoundOrEmpty(ATTACHMENTS).contains(FeatureSpills.SPILLS_ID)) s.add(pos);
@@ -130,7 +209,7 @@ public final class Pruner {
 				withSpills.addAll(s);
 			}
 		});
-		return new Scan(keep, withSpills, total.get(), used.get());
+		return new Scan(keep, withSpills, total.get(), used.get(), oldKept.get());
 	}
 
 	private static long rewrite(Path file, Scan scan, boolean chunks, AtomicLong droppedRecords) throws IOException {
@@ -224,6 +303,20 @@ public final class Pruner {
 			byte[] bytes = Files.readAllBytes(file);
 			if (bytes.length < 2 * SECTOR) bytes = java.util.Arrays.copyOf(bytes, 2 * SECTOR);
 			return new Region(file, bytes, Integer.parseInt(m.group(1)), Integer.parseInt(m.group(2)));
+		}
+
+		static Region readHeader(Path file) throws IOException {
+			Matcher m = REGION_NAME.matcher(file.getFileName().toString());
+			if (!m.matches()) throw new IOException("not a region file: " + file);
+			byte[] bytes = new byte[SECTOR];
+			try (InputStream in = Files.newInputStream(file)) {
+				in.readNBytes(bytes, 0, SECTOR);
+			}
+			return new Region(file, bytes, Integer.parseInt(m.group(1)), Integer.parseInt(m.group(2)));
+		}
+
+		boolean listed(int i) {
+			return buf.getInt(i * 4) != 0;
 		}
 
 		long pos(int i) {

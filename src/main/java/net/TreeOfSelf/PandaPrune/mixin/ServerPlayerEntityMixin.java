@@ -16,6 +16,8 @@ public abstract class ServerPlayerEntityMixin {
 	@Inject(method = "removeVehicle", at = @At("HEAD"))
 	public void removeVehicle(CallbackInfo ci) {
 		ServerPlayer self = (ServerPlayer) (Object) this;
+		// teleports call this too, without a vehicle
+		if (self.getVehicle() == null) return;
 		ServerLevel world = self.level();
 		Player playerEntity = (Player) (Object) this;
 		BlockPos pos = playerEntity.blockPosition();

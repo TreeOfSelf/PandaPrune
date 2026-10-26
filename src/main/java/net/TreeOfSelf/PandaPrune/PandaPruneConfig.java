@@ -22,6 +22,8 @@ public class PandaPruneConfig {
 	public long pruneMinInhabitedTicks = 6000;
 	public List<String> pruneDimensions = new ArrayList<>();
 	public boolean restoreFeatures = true;
+	// also prune chunks that existed before Prune was installed (their earlier use was never tracked)
+	public boolean pruneOldChunks = false;
 
 	public static PandaPruneConfig load() {
 		PandaPruneConfig config = new PandaPruneConfig();
