@@ -60,8 +60,9 @@ public class PandaPrune implements ModInitializer {
 		});
 
 		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
-			LevelChunk chunk = world.getChunkAt(hitResult.getBlockPos());
-			protect(chunk);
+			protect(world.getChunkAt(hitResult.getBlockPos()));
+			// a placed block lands on the clicked face, which can be in the next chunk over
+			protect(world.getChunkAt(hitResult.getBlockPos().relative(hitResult.getDirection())));
 			return InteractionResult.PASS;
 		});
 

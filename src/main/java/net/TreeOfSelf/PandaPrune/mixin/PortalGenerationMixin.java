@@ -25,8 +25,9 @@ public class PortalGenerationMixin {
 
 	@Inject(method = "createPortalBlocks", at = @At("TAIL"))
 	private void onPortalCreated(LevelAccessor world, CallbackInfo ci) {
-		for (int w = 0; w < width; w++) {
-			for (int h = 0; h < height; h++) {
+		// include the frame, which can sit in the next chunk over
+		for (int w = -1; w <= width; w++) {
+			for (int h = -1; h <= height; h++) {
 				BlockPos pos = bottomLeft
 						.relative(rightDir, w)
 						.relative(Direction.UP, h);
