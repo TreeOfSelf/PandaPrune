@@ -71,9 +71,18 @@ public class PandaPrune implements ModInitializer {
 			protect(chunk);
 		});
 
+		// A dropped connection fires this on a Netty thread. Touching the chunk from there is an off-thread chunk
+		// change (C2ME threw ConcurrentModificationException and the flag could be lost): do it on the server thread,
+		// and only if the chunk is still loaded (it is, the player was just in it) so this never loads one.
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
-			LevelChunk chunk = handler.player.level().getChunkAt(handler.player.blockPosition());
-			protect(chunk);
+			net.minecraft.server.level.ServerLevel level = handler.player.level();
+			net.minecraft.core.BlockPos pos = handler.player.blockPosition();
+			Runnable mark = () -> {
+				LevelChunk chunk = level.getChunkSource().getChunkNow(pos.getX() >> 4, pos.getZ() >> 4);
+				if (chunk != null) protect(chunk);
+			};
+			if (server.isSameThread()) mark.run();
+			else server.execute(mark);
 		});
 
 		ServerLivingEntityEvents.AFTER_DEATH.register((entity, damageSource) -> {
